@@ -415,16 +415,28 @@ pub const Handshake = struct {
             // the server pays for the server's side: on a CPU without AES
             // instructions AES-GCM costs about 3x ChaCha20, so the server's
             // list, which puts ChaCha20 first there, should decide.
+            //
+            // One exception, as Go's crypto/tls makes it: a client whose first
+            // AEAD (of AES-GCM and ChaCha20, whatever we support) is ChaCha20 is
+            // saying it has no AES hardware, so it gets the ChaCha20 suite we
+            // support that ranks best for us, even from a server that would
+            // prefer AES. Never one the server left out of its list.
             var best: ?usize = null; // index into `supported_cipher_suites`
+            var best_chacha: ?usize = null; // the same, ChaCha20 suites only
+            var client_aead: ?Aead = null; // the client's first AES-GCM or ChaCha20
             while (d.idx < end_idx) {
                 const cipher_suite = try d.decode(CipherSuite);
+                if (client_aead == null) client_aead = aeadOf(cipher_suite);
                 for (supported_cipher_suites, 0..) |supported, rank| {
                     if (supported != cipher_suite) continue;
                     if (best == null or rank < best.?) best = rank;
+                    if (aeadOf(supported) == .chacha and (best_chacha == null or rank < best_chacha.?)) best_chacha = rank;
                     break;
                 }
             }
-            h.cipher_suite = supported_cipher_suites[best orelse return error.TlsNoSupportedCiphers];
+            const pick = best orelse return error.TlsNoSupportedCiphers;
+            const client_wants_chacha = client_aead == .chacha and best_chacha != null;
+            h.cipher_suite = supported_cipher_suites[if (client_wants_chacha) best_chacha.? else pick];
         }
         try d.skip(2); // compression methods
 
@@ -560,8 +572,33 @@ test "read client hello" {
     try testing.expectEqualSlices(u8, &data13.client_public_key, h.client_pub_key);
 }
 
+const Aead = enum { aes_gcm, chacha };
+
+/// The AEAD family of a suite, for reading a client's hardware from its first
+/// choice; null for anything else (CBC, AEGIS, GREASE, signalling values).
+fn aeadOf(cs: CipherSuite) ?Aead {
+    return switch (cs) {
+        .AES_128_GCM_SHA256,
+        .AES_256_GCM_SHA384,
+        .ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+        .ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+        .ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+        .ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+        => .aes_gcm,
+        .CHACHA20_POLY1305_SHA256,
+        .ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+        .ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
+        => .chacha,
+        else => null,
+    };
+}
+
 fn clientHelloSuite(server_suites: []const CipherSuite) !CipherSuite {
-    var reader: Io.Reader = .fixed(&data13.client_hello);
+    return clientHelloSuiteFrom(&data13.client_hello, server_suites);
+}
+
+fn clientHelloSuiteFrom(hello: []const u8, server_suites: []const CipherSuite) !CipherSuite {
+    var reader: Io.Reader = .fixed(hello);
     var h: Handshake = .{ .input = &reader, .output = undefined };
     h.signature_scheme = .ecdsa_secp521r1_sha512;
     try h.readClientHello(server_suites, &.{});
@@ -586,6 +623,33 @@ test "the server's order picks the cipher suite, not the client's" {
     );
     // Nothing in common is still an error.
     try testing.expectError(error.TlsNoSupportedCiphers, clientHelloSuite(&.{.AEGIS_128L_SHA256}));
+}
+
+test "a client that puts ChaCha20 first gets it, even from a server that prefers AES" {
+    // The same client hello, its three suites reordered in place (lengths and
+    // offsets unchanged): CHACHA20_POLY1305_SHA256, AES_256_GCM_SHA384,
+    // AES_128_GCM_SHA256. Record header 5, handshake header 4, version 2,
+    // random 32, then the session id's length byte and the session id.
+    var hello = data13.client_hello;
+    const sid_len = hello[5 + 4 + 2 + 32];
+    const suites = 5 + 4 + 2 + 32 + 1 + sid_len + 2; // past the list's length
+    @memcpy(hello[suites..][0..6], &[_]u8{ 0x13, 0x03, 0x13, 0x02, 0x13, 0x01 });
+
+    // A server that would pick AES-128 by its own order yields to the client.
+    try testing.expectEqual(
+        CipherSuite.CHACHA20_POLY1305_SHA256,
+        try clientHelloSuiteFrom(&hello, &.{ .AES_128_GCM_SHA256, .CHACHA20_POLY1305_SHA256 }),
+    );
+    // But never past the server's own list: no ChaCha20 there, none chosen.
+    try testing.expectEqual(
+        CipherSuite.AES_128_GCM_SHA256,
+        try clientHelloSuiteFrom(&hello, &.{ .AES_128_GCM_SHA256, .AES_256_GCM_SHA384 }),
+    );
+    // A client that prefers AES still gets the server's order (as above).
+    try testing.expectEqual(
+        CipherSuite.AES_128_GCM_SHA256,
+        try clientHelloSuite(&.{ .AES_128_GCM_SHA256, .CHACHA20_POLY1305_SHA256 }),
+    );
 }
 
 test "make server hello" {
